@@ -1,20 +1,18 @@
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-# SPDX-License-Identifier: MIT-0.
-
 '''
-Example to demonstrate usage the AWS Kinesis Video Streams (KVS) Consumer Library for Python.
+Example to demonstrate usage the AWS Kinesis Video Streams (KVS) Audio Consumer Library for Python.
  '''
  
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 __status__ = "Development"
-__copyright__ = "Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved."
-__author__ = "Dean Colcott <https://www.linkedin.com/in/deancolcott/>"
+__author__ = "Dean Colcott <https://www.linkedin.com/in/deancolcott/>, Nicolas Neudeck <https://www.linkedin.com/in/nicolasneudeck/>"
 
+from io import BytesIO
 import os
 import sys
 import time
 import boto3
 import logging
+from pydub import AudioSegment
 from amazon_kinesis_video_consumer_library.kinesis_video_streams_parser import KvsConsumerLibrary
 from amazon_kinesis_video_consumer_library.kinesis_video_fragment_processor import KvsFragementProcessor
 
@@ -25,8 +23,9 @@ logging.basicConfig(format="[%(name)s.%(funcName)s():%(lineno)d] - [%(levelname)
                     level=logging.INFO)
 
 # Update the desired region and KVS stream name.
-REGION='[ENTER_REGION]'
-KVS_STREAM01_NAME = '[ENTER_KVS_STREAM_NAME]'   # Stream must be in specified region
+REGION='[YOUR_REGION]'  # Region where the KVS stream is located
+KVS_STREAM_NAME = '[YOUR_STREAM_NAME]'   # Stream must be in specified region
+FRAGMENT_NUMBER = '[YOUR_FRAGMENT_NUMBER]'     # Fragment number to start reading from
 
 
 class KvsPythonConsumerExample:
@@ -56,6 +55,14 @@ class KvsPythonConsumerExample:
         self.session = boto3.Session(region_name=REGION)
         self.kvs_client = self.session.client("kinesisvideo")
 
+        # Initialize the audio track bytearrays
+        self.audio_to_customer = bytearray()
+        self.audio_from_customer = bytearray()
+
+        self.current_audio_length = 0.0
+
+        self.stream_stopped = False
+
     ####################################################
     # Main process loop
     def service_loop(self):
@@ -64,25 +71,41 @@ class KvsPythonConsumerExample:
         # Start an instance of the KvsConsumerLibrary reading in a Kinesis Video Stream
 
         # Get the KVS Endpoint for the GetMedia Call for this stream
-        log.info(f'Getting KVS GetMedia Endpoint for stream: {KVS_STREAM01_NAME} ........') 
-        get_media_endpoint = self._get_data_endpoint(KVS_STREAM01_NAME, 'GET_MEDIA')
+        log.info(
+            "Getting KVS GetMedia Endpoint for stream: {} ........".format(
+                KVS_STREAM_NAME
+            )
+        )
+        get_media_endpoint = self._get_data_endpoint(
+            KVS_STREAM_NAME, "GET_MEDIA"
+        )
         
         # Get the KVS Media client for the GetMedia API call
-        log.info(f'Initializing KVS Media client for stream: {KVS_STREAM01_NAME}........') 
+        log.info(f'Initializing KVS Media client for stream: {KVS_STREAM_NAME}........') 
         kvs_media_client = self.session.client('kinesis-video-media', endpoint_url=get_media_endpoint)
 
         # Make a KVS GetMedia API call with the desired KVS stream and StartSelector type and time bounding.
-        log.info(f'Requesting KVS GetMedia Response for stream: {KVS_STREAM01_NAME}........') 
+        log.info(f'Requesting KVS GetMedia Response for stream: {KVS_STREAM_NAME}........')
+
+
+        # get_media_response = kvs_media_client.get_media(
+        #     StreamName=KVS_STREAM_NAME,
+        #     StartSelector={
+        #         'StartSelectorType': 'NOW'
+        #     }
+        # )
+
         get_media_response = kvs_media_client.get_media(
-            StreamName=KVS_STREAM01_NAME,
+            StreamName=KVS_STREAM_NAME,
             StartSelector={
-                'StartSelectorType': 'NOW'
-            }
+                "StartSelectorType": "FRAGMENT_NUMBER",
+                "AfterFragmentNumber": FRAGMENT_NUMBER,
+            },
         )
 
         # Initialize an instance of the KvsConsumerLibrary, provide the GetMedia response and the required call-backs
-        log.info(f'Starting KvsConsumerLibrary for stream: {KVS_STREAM01_NAME}........') 
-        my_stream01_consumer = KvsConsumerLibrary(KVS_STREAM01_NAME, 
+        log.info(f'Starting KvsConsumerLibrary for stream: {KVS_STREAM_NAME}........') 
+        my_stream01_consumer = KvsConsumerLibrary(KVS_STREAM_NAME, 
                                               get_media_response, 
                                               self.on_fragment_arrived, 
                                               self.on_stream_read_complete, 
@@ -101,14 +124,17 @@ class KvsPythonConsumerExample:
     
         # Run a loop with the applications main functionality that holds the process open.
         # Can also use to monitor the completion of the KvsConsumerLibrary instance and trigger a required action on completion.
-        while True:
+        while not self.stream_stopped:
 
             #Add Main process / application logic here while KvsConsumerLibrary instance runs as a thread
             log.info("Nothn to see, just doin main application stuff in a loop here!")
-            time.sleep(5)
+            time.sleep(2)
             
             # Call below to exit the streaming get_media() thread gracefully before reaching end of stream. 
             #my_stream01_consumer.stop_thread()
+
+        my_stream01_consumer.join()
+        print('KvsConsumerLibrary Thread has exited - Main Application Loop will now exit.')
 
 
     ####################################################
@@ -155,6 +181,11 @@ class KvsPythonConsumerExample:
             # Get the fragment tags and save in local parameter.
             self.last_good_fragment_tags = self.kvs_fragment_processor.get_fragment_tags(fragment_dom)
 
+            # Get the fragment number and save in local parameter.
+            stream_fragment_number = self.last_good_fragment_tags[
+                "AWS_KINESISVIDEO_CONTINUATION_TOKEN"
+            ]
+
             ##### Log Time Deltas:  local time Vs fragment SERVER and PRODUCER Timestamp:
             time_now = time.time()
             kvs_ms_behind_live = float(self.last_good_fragment_tags['AWS_KINESISVIDEO_MILLIS_BEHIND_NOW'])
@@ -186,67 +217,31 @@ class KvsPythonConsumerExample:
             pretty_frag_dom = self.kvs_fragment_processor.get_fragement_dom_pretty_string(fragment_dom)
             log.info(pretty_frag_dom)
 
-            ###########################################
-            # 3) Write the Fragment to disk as standalone MKV file
-            ###########################################
-            save_dir = 'ENTER_DIRECTORY_PATH_TO_SAVE_FRAGEMENTS'
-            frag_file_name = self.last_good_fragment_tags['AWS_KINESISVIDEO_FRAGMENT_NUMBER'] + '.mkv' # Update as needed
-            frag_file_path = os.path.join(save_dir, frag_file_name)
-            # Uncomment below to enable this function - will take a significant amount of disk space if left running unchecked:
-            #log.info('')
-            #log.info(f'####### Saving fragment to local disk at: {frag_file_path}')
-            #self.kvs_fragment_processor.save_fragment_as_local_mkv(fragment_bytes, frag_file_path)
-
-            ###########################################
-            # 4) Extract Frames from Fragment as ndarrays:
-            ###########################################
-            # Get a ratio of available frames in the fragment as a list of numpy.ndarray's
-            # Here we just log the shape of each image array but ndarray lends itself to many powerful 
-            # data science, computer vision and video analytic functions in particular.
-            one_in_frames_ratio = 5
-            log.info('')
-            log.info(f'#######  Reading 1 in {one_in_frames_ratio} Frames from fragment as ndarray:')
-            ndarray_frames = self.kvs_fragment_processor.get_frames_as_ndarray(fragment_bytes, one_in_frames_ratio)
-            for i in range(len(ndarray_frames)):
-                ndarray_frame = ndarray_frames[i]
-                log.info(f'Frame-{i} Shape: {ndarray_frame.shape}')
             
             ###########################################
-            # 5) Save Frames from Fragment to local disk as JPGs
+            # 3) add audio to customer and agent
             ###########################################
-            # Get a ratio of available frames in the fragment and save as JPGs to local disk.
-            # JPEGs could also be sent to other AWS services such as Amazon Rekognition and Amazon Sagemaker
-            # for computer vision inference. 
-            # Alternatively, these could be sent to Amazon S3 and used to create a timelapse set of images or 
-            # further processed into timed thumbnails for the KVS media stream.
-            one_in_frames_ratio = 5
-            save_dir = 'ENTER_DIRECTORY_PATH_TO_SAVE_JPEG_FRAMES'
-            jpg_file_base_name = self.last_good_fragment_tags['AWS_KINESISVIDEO_FRAGMENT_NUMBER']
-            jpg_file_base_path = os.path.join(save_dir, jpg_file_base_name)
-            
-            # Uncomment below to enable this function - will take a significant amount of disk space if left running unchecked:
-            #log.info('')
-            #log.info(f'####### Saving 1 in {one_in_frames_ratio} Frames from fragment as JPEG to base path: {jpg_file_base_path}')
-            #jpeg_paths = self.kvs_fragment_processor.save_frames_as_jpeg(fragment_bytes, one_in_frames_ratio, jpg_file_base_path)
-            #for i in range(len(jpeg_paths)):
-            #    jpeg_path = jpeg_paths[i]
-            #    print(f'Saved JPEG-{i} Path: {jpeg_path}')
-
-            
-            ###########################################
-            # 6) Save Amazon Connect Frames from Fragment to local disk as WAVs
-            ###########################################
-            save_dir = 'ENTER_DIRECTORY_PATH_TO_SAVE_WAV_FRAMES'
-            wav_file_base_name = self.last_good_fragment_tags['AWS_KINESISVIDEO_FRAGMENT_NUMBER']
-            wav_file_base_path = os.path.join(save_dir, wav_file_base_name)
-            
-            # Uncomment below to enable this function - will take a significant amount of disk space if left running unchecked:
-            #log.info('')
-            #log.info(f'####### Saving audio track "AUDIO_FROM_CUSTOMER" from Amazon Connect fragment as WAV to base path: {wav_file_base_path}')
-            #self.kvs_fragment_processor.save_connect_fragment_audio_track_from_customer_as_wav(fragment_dom, wav_file_base_path)
-            #log.info(f'####### Saving audio track "AUDIO_TO_CUSTOMER" from Amazon Connect fragment as WAV to base path: {wav_file_base_path}')
-            #self.kvs_fragment_processor.save_connect_fragment_audio_track_to_customer_as_wav(fragment_dom, wav_file_base_path)
-
+            simple_block_elements = self.kvs_fragment_processor.get_simple_block_offset(
+                fragment_dom
+            )
+            audio_from_customer_track, audio_to_customer_track = (
+                self.kvs_fragment_processor.get_audio_tracks(fragment_dom)
+            )
+            log.debug(f"audio_from_customer_track: {audio_from_customer_track}")
+            log.debug(f"audio_to_customer_track: {audio_to_customer_track}")
+            for offset, size in simple_block_elements:
+                track_number, data_payload = (
+                    self.kvs_fragment_processor.extract_simpleblock_data(
+                        fragment_bytes[offset : (offset + size)]
+                    )
+                )
+                if track_number == audio_from_customer_track:
+                    self.audio_from_customer.extend(data_payload)
+                elif track_number == audio_to_customer_track:
+                    self.audio_to_customer.extend(data_payload)
+                length = float(size) / 2.0 / 8000.0
+                self.current_audio_length += length
+                log.debug(f"Audio Length: {self.current_audio_length}")
 
         except Exception as err:
             log.error(f'on_fragment_arrived Error: {err}')
@@ -272,6 +267,73 @@ class KvsPythonConsumerExample:
 
         # Do something here to tell the application that reading from the stream ended gracefully.
         print(f'Read Media on stream: {stream_name} Completed successfully - Last Fragment Tags: {self.last_good_fragment_tags}')
+        self.save_audio_files(self.audio_to_customer, self.audio_from_customer)
+        self.stream_stopped = True
+
+    def save_audio_files(self, audio_to_customer, audio_from_customer):
+        min_length = min(len(audio_to_customer), len(audio_from_customer))
+        channels = 1
+        sample_width = 2
+        sample_rate = 8000
+        audio_to_customer_audio_stream = BytesIO(bytes(audio_to_customer[:min_length]))
+        audio_to_customer_audio_segment = AudioSegment.from_file(
+            audio_to_customer_audio_stream,
+            format="raw",
+            codec="pcm_s16le",
+            frame_rate=sample_rate,
+            channels=channels,
+            sample_width=sample_width,
+        )
+
+        audio_from_customer_audio_stream = BytesIO(
+            bytes(audio_from_customer[:min_length])
+        )
+        audio_from_customer_audio_segment = AudioSegment.from_file(
+            audio_from_customer_audio_stream,
+            format="raw",
+            codec="pcm_s16le",
+            frame_rate=sample_rate,
+            channels=channels,
+            sample_width=sample_width,
+        )
+
+        # if the audio is not the same length, we need to add silence to the shorter one
+        max_length = max(
+            len(audio_to_customer_audio_segment), len(audio_from_customer_audio_segment)
+        )
+        audio_to_customer_audio_segment = (
+            audio_to_customer_audio_segment
+            + AudioSegment.silent(
+                duration=max_length - len(audio_to_customer_audio_segment),
+                frame_rate=sample_rate,
+            )
+        )
+        audio_from_customer_audio_segment = (
+            audio_from_customer_audio_segment
+            + AudioSegment.silent(
+                duration=max_length - len(audio_from_customer_audio_segment),
+                frame_rate=sample_rate,
+            )
+        )
+
+
+        # MONO (agent and customer audio combined)
+        # combined_audio1_file_name = "combined_mono_audio.wav"
+        # combined_audio1 = audio_to_customer_audio_segment.overlay(
+        #     audio_from_customer_audio_segment
+        # )
+        # combined_audio1.export(combined_audio1_file_name, format='wav')
+
+        # STEREO (agent on left channel, customer on right channel - good for transcription)
+        combined_audio_file_name = "combined_stereo_audio.wav"
+        try:
+            combined_audio = AudioSegment.from_mono_audiosegments(
+                audio_from_customer_audio_segment, audio_to_customer_audio_segment
+            )
+            combined_audio.export(combined_audio_file_name, format='wav')
+        except Exception as e:
+            log.error(f"Error combining audio: {e}")
+        
 
     def on_stream_read_exception(self, stream_name, error):
         '''
